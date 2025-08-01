@@ -1,0 +1,322 @@
+name: Gateway CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'src/**'
+      - 'lib/**'
+      - 'include/**'
+      - 'platformio.ini'
+      - '.github/workflows/gateway-ci.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'src/**'
+      - 'lib/**'
+      - 'include/**'
+      - 'platformio.ini'
+      - '.github/workflows/gateway-ci.yml'
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        environment: [lilygo-t3s3]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v3
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-${{ hashFiles('**/lockfiles') }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade platformio
+
+      - name: Install library dependencies
+        run: pio pkg install
+
+      - name: Build gateway firmware for ${{ matrix.environment }}
+        run: pio run -e ${{ matrix.environment }}
+
+      - name: Build filesystem (if exists)
+        run: |
+          if [ -d "data" ]; then
+            pio run -e ${{ matrix.environment }} -t buildfs
+          fi
+        continue-on-error: true
+
+      - name: Run static analysis
+        run: pio check -e ${{ matrix.environment }} --skip-packages
+        continue-on-error: true
+
+      - name: Upload gateway firmware artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: gateway-firmware-${{ matrix.environment }}
+          path: |
+            .pio/build/${{ matrix.environment }}/firmware.bin
+            .pio/build/${{ matrix.environment }}/firmware.elf
+          retention-days: 30
+
+  code-quality:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade platformio
+
+      - name: Install dependencies
+        run: pio pkg install
+
+      - name: Check code formatting (if clang-format available)
+        run: |
+          if command -v clang-format &> /dev/null; then
+            find src -name "*.cpp" -o -name "*.h" | xargs clang-format --dry-run --Werror
+          else
+            echo "clang-format not available, skipping format check"
+          fi
+        continue-on-error: true
+
+      - name: Run static analysis
+        run: pio check --skip-packages
+        continue-on-error: true
+
+      - name: Check for gateway-specific issues
+        run: |
+          echo "Checking for gateway-specific issues..."
+          
+          # Check for proper network includes
+          if ! grep -q "#include.*WiFi\|#include.*HTTP" src/*.cpp; then
+            echo "Warning: Network libraries not included"
+          fi
+          
+          # Check for error handling in network operations
+          if ! grep -q "try\|catch\|error\|Error\|timeout" src/*.cpp; then
+            echo "Warning: Limited error handling detected"
+          fi
+          
+          # Check for proper configuration management
+          if ! grep -q "SSID\|PASSWORD\|API.*URL" src/*.cpp src/*.h; then
+            echo "Warning: Configuration parameters not found"
+          fi
+
+  network-security:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Network security analysis
+        run: |
+          echo "Analyzing network security..."
+          
+          # Check for HTTPS usage
+          if grep -r "http://" src/ --include="*.cpp" --include="*.h"; then
+            echo "Warning: HTTP (non-secure) connections detected"
+          fi
+          
+          # Check for certificate validation
+          if ! grep -r "certificate\|cert\|ssl\|tls" src/ --include="*.cpp" --include="*.h"; then
+            echo "Info: No certificate validation found - ensure HTTPS is properly configured"
+          fi
+          
+          # Check for hardcoded network credentials
+          if grep -r -E "(SSID|PASSWORD|ssid|password).*=.*[\"\'][^\"\']{3,}" src/ --include="*.cpp" --include="*.h"; then
+            echo "Error: Hardcoded network credentials detected!"
+            exit 1
+          fi
+          
+          # Check for API key security
+          if grep -r -E "(API_KEY|api.*key).*=.*[\"\'][^\"\']{8,}" src/ --include="*.cpp" --include="*.h"; then
+            echo "Error: Hardcoded API keys detected!"
+            exit 1
+          fi
+
+  connectivity-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade platformio
+
+      - name: Build firmware
+        run: pio run
+
+      - name: Analyze connectivity patterns
+        run: |
+          echo "Analyzing connectivity patterns..."
+          
+          # Check for retry logic
+          if ! grep -r "retry\|reconnect\|attempt" src/ --include="*.cpp" --include="*.h"; then
+            echo "Warning: No retry/reconnection logic detected"
+          fi
+          
+          # Check for connection monitoring
+          if ! grep -r "connected\|status\|isConnected" src/ --include="*.cpp" --include="*.h"; then
+            echo "Warning: Limited connection monitoring detected"
+          fi
+          
+          # Check for timeout handling
+          if ! grep -r "timeout\|Timeout\|TIMEOUT" src/ --include="*.cpp" --include="*.h"; then
+            echo "Warning: No timeout handling detected"
+          fi
+
+  memory-analysis:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade platformio
+
+      - name: Build and analyze gateway memory usage
+        run: |
+          pio run
+          
+          # Extract memory information
+          if [ -f ".pio/build/lilygo-t3s3/firmware.elf" ]; then
+            echo "Gateway memory usage analysis:"
+            pio run -t size
+            
+            # Gateway-specific memory checks
+            FLASH_USAGE=$(pio run -t size | grep "Flash:" | awk '{print $3}' | tr -d '%')
+            RAM_USAGE=$(pio run -t size | grep "RAM:" | awk '{print $3}' | tr -d '%')
+            
+            if [ -n "$FLASH_USAGE" ] && [ "$FLASH_USAGE" -gt 85 ]; then
+              echo "Warning: Flash usage is ${FLASH_USAGE}% - consider optimizing gateway code"
+            fi
+            
+            if [ -n "$RAM_USAGE" ] && [ "$RAM_USAGE" -gt 75 ]; then
+              echo "Warning: RAM usage is ${RAM_USAGE}% - gateway needs buffer space for network operations"
+            fi
+          fi
+
+  integration-readiness:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check integration readiness
+        run: |
+          echo "Checking gateway integration readiness..."
+          
+          # Check for API endpoint configuration
+          if ! grep -r "endpoint\|url\|URL\|api" src/ --include="*.cpp" --include="*.h"; then
+            echo "Warning: No API endpoint configuration found"
+          fi
+          
+          # Check for data forwarding logic
+          if ! grep -r "forward\|send\|post\|POST" src/ --include="*.cpp" --include="*.h"; then
+            echo "Warning: No data forwarding logic detected"
+          fi
+          
+          # Check for LoRa configuration
+          if ! grep -r "LoRa\|lora\|LORA" src/ --include="*.cpp" --include="*.h"; then
+            echo "Warning: No LoRa configuration detected"
+          fi
+          
+          # Check for JSON handling
+          if ! grep -r "json\|JSON\|Json" src/ --include="*.cpp" --include="*.h"; then
+            echo "Warning: No JSON handling detected"
+          fi
+
+  release:
+    needs: [build-and-test, code-quality, network-security]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade platformio
+
+      - name: Build release gateway firmware
+        run: pio run
+
+      - name: Create gateway release artifacts
+        run: |
+          mkdir -p release
+          cp .pio/build/lilygo-t3s3/firmware.bin release/cragcrowd-gateway-firmware.bin
+          cp .pio/build/lilygo-t3s3/firmware.elf release/cragcrowd-gateway-firmware.elf
+          
+          # Create gateway-specific documentation
+          echo "CragCrowd Gateway Firmware" > release/README.txt
+          echo "=========================" >> release/README.txt
+          echo "Build Date: $(date)" >> release/README.txt
+          echo "Commit SHA: ${{ github.sha }}" >> release/README.txt
+          echo "Branch: ${{ github.ref_name }}" >> release/README.txt
+          echo "" >> release/README.txt
+          echo "Configuration Required:" >> release/README.txt
+          echo "- WiFi SSID and Password" >> release/README.txt
+          echo "- CragCrowd API endpoint URL" >> release/README.txt
+          echo "- LoRa frequency matching sensor nodes" >> release/README.txt
+
+      - name: Upload gateway release artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: cragcrowd-gateway-release
+          path: release/
+          retention-days: 90
